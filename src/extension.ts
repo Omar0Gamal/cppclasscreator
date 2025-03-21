@@ -2,7 +2,51 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 
 /**
- * Prompts the user to select a base folder from all workspace folders using a dropdown.
+ * Reads the given directory and returns a list of its subdirectories.
+ */
+async function getSubdirectories(dir: vscode.Uri): Promise<vscode.Uri[]> {
+    const entries = await vscode.workspace.fs.readDirectory(dir);
+    // Filter for directories (FileType 2 indicates a directory)
+    const dirs = entries.filter(([_, fileType]) => fileType === vscode.FileType.Directory);
+    return dirs.map(([name, _]) => vscode.Uri.joinPath(dir, name));
+}
+
+/**
+ * Prompts the user to select a subfolder from the given root folder.
+ * Includes an option to use the root folder itself.
+ */
+async function selectSubFolder(root: vscode.Uri): Promise<vscode.Uri | undefined> {
+    let subdirs: vscode.Uri[];
+    try {
+        subdirs = await getSubdirectories(root);
+    } catch (error) {
+        vscode.window.showErrorMessage("Failed to read subdirectories: " + error);
+        return undefined;
+    }
+    const items = subdirs.map(uri => ({
+        label: path.basename(uri.fsPath),
+        uri
+    }));
+    // Add an option to use the root folder itself.
+    items.unshift({
+        label: "(Use current folder)",
+        uri: root
+    });
+    const selected = await vscode.window.showQuickPick(
+        items.map(item => item.label),
+        { placeHolder: 'Select a base folder from subdirectories' }
+    );
+    if (!selected) {
+        return undefined;
+    }
+    const found = items.find(item => item.label === selected);
+    return found?.uri;
+}
+
+/**
+ * Prompts the user to select a base folder.
+ * If there is more than one workspace folder, shows a picker for those.
+ * If there's only one, it then shows a picker for its subdirectories.
  */
 async function selectBaseFolder(): Promise<vscode.Uri | undefined> {
     const folders = vscode.workspace.workspaceFolders;
@@ -11,18 +55,20 @@ async function selectBaseFolder(): Promise<vscode.Uri | undefined> {
         return undefined;
     }
     if (folders.length === 1) {
-        return folders[0].uri;
+        // Force selecting a subfolder from the single workspace folder.
+        return await selectSubFolder(folders[0].uri);
     }
-    // Create a dropdown list of folder names.
+    // If multiple workspace folders exist, let the user pick one.
     const folderNames = folders.map(folder => folder.name);
     const selectedName = await vscode.window.showQuickPick(folderNames, {
-        placeHolder: 'Select the base folder for the generated files'
+        placeHolder: 'Select the workspace folder'
     });
     if (!selectedName) {
         return undefined;
     }
     const selectedFolder = folders.find(folder => folder.name === selectedName);
-    return selectedFolder?.uri;
+    // Then select a subfolder within the chosen workspace folder.
+    return await selectSubFolder(selectedFolder!.uri);
 }
 
 /**
@@ -72,11 +118,9 @@ async function getOrCreateCopyrightNotice(
 
 export function activate(context: vscode.ExtensionContext) {
     let disposable = vscode.commands.registerCommand('extension.createClassFiles', async () => {
-        // Select the base folder.
+        // Select the base folder (a subfolder of the workspace folder).
         const baseFolder = await selectBaseFolder();
-        if (!baseFolder) {
-            return;
-        }
+        if (!baseFolder) { return; }
         const wsPath = baseFolder.fsPath;
 
         // Retrieve or create the COPYRIGHT.txt notice.
@@ -97,9 +141,9 @@ export function activate(context: vscode.ExtensionContext) {
             return;
         }
 
-        // Prompt for the namespace (e.g., "nebula::math").
+        // Prompt for the namespace (e.g. "nebula::math").
         const nsInput = await vscode.window.showInputBox({
-            prompt: 'Enter namespace (e.g. nebula::math) or leave empty'
+            prompt: 'Enter namespace (e.g., nebula::math) or leave empty'
         });
         let openNamespaces = '';
         let closeNamespaces = '';
@@ -116,9 +160,7 @@ export function activate(context: vscode.ExtensionContext) {
             ['Same Folder', 'Separate Folders'],
             { placeHolder: 'Choose file placement' }
         );
-        if (!placementOption) {
-            return;
-        }
+        if (!placementOption) { return; }
 
         if (placementOption === 'Separate Folders') {
             // Prompt for header subfolder (e.g. "include/math").
@@ -126,9 +168,7 @@ export function activate(context: vscode.ExtensionContext) {
                 prompt: 'Enter header subfolder (relative to base, e.g. include/math)',
                 value: 'include'
             });
-            if (!headerFolderInput) {
-                return;
-            }
+            if (!headerFolderInput) { return; }
             const headerSubfolder = headerFolderInput.trim();
 
             // Auto-suggest source subfolder by replacing "include" with "src" if applicable.
@@ -140,9 +180,7 @@ export function activate(context: vscode.ExtensionContext) {
                 prompt: 'Enter source subfolder (relative to base, e.g. src/math)',
                 value: defaultSourceSubfolder
             });
-            if (!sourceFolderInput) {
-                return;
-            }
+            if (!sourceFolderInput) { return; }
             const sourceSubfolder = sourceFolderInput.trim();
 
             // Compute absolute paths.
@@ -158,7 +196,7 @@ export function activate(context: vscode.ExtensionContext) {
                 ? `#include "${directiveFolder}/${className}.hpp"`
                 : `#include "${className}.hpp"`;
 
-            // Generate header content (.hpp): Copyright notice first, then #pragma once, then (optional) namespaces and class.
+            // Generate header content (.hpp): copyright, then #pragma once, then namespaces and class.
             let headerContent = `${copyrightNotice}\n\n`;
             headerContent += "#pragma once\n\n";
             if (openNamespaces) {
