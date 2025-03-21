@@ -2,19 +2,45 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 
 /**
- * Retrieves the COPYRIGHT.txt content from the workspace root.
- * If not present, prompts the user for their name and project name,
- * creates the file, and returns the generated notice.
+ * Prompts the user to select a base folder from all workspace folders using a dropdown.
  */
-async function getOrCreateCopyrightNotice(workspaceFolder: vscode.Uri): Promise<string> {
-    const copyrightFile = vscode.Uri.joinPath(workspaceFolder, 'COPYRIGHT.txt');
+async function selectBaseFolder(): Promise<vscode.Uri | undefined> {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) {
+        vscode.window.showErrorMessage('No workspace folder open.');
+        return undefined;
+    }
+    if (folders.length === 1) {
+        return folders[0].uri;
+    }
+    // Create a dropdown list of folder names.
+    const folderNames = folders.map(folder => folder.name);
+    const selectedName = await vscode.window.showQuickPick(folderNames, {
+        placeHolder: 'Select the base folder for the generated files'
+    });
+    if (!selectedName) {
+        return undefined;
+    }
+    const selectedFolder = folders.find(folder => folder.name === selectedName);
+    return selectedFolder?.uri;
+}
+
+/**
+ * Retrieves the COPYRIGHT.txt content from the workspace base folder.
+ * If not present, prompts for author and project name, creates the file, and returns the notice.
+ */
+async function getOrCreateCopyrightNotice(
+    workspaceFolder: vscode.Uri
+): Promise<string> {
+    const copyrightUri = vscode.Uri.joinPath(
+        workspaceFolder,
+        'COPYRIGHT.txt'
+    );
     try {
-        // If the file exists, read its contents.
-        await vscode.workspace.fs.stat(copyrightFile);
-        const data = await vscode.workspace.fs.readFile(copyrightFile);
+        await vscode.workspace.fs.stat(copyrightUri);
+        const data = await vscode.workspace.fs.readFile(copyrightUri);
         return Buffer.from(data).toString('utf8');
-    } catch (error) {
-        // File doesn't exist; prompt for info.
+    } catch {
         const author = await vscode.window.showInputBox({
             prompt: 'Enter your name (for copyright notice)'
         });
@@ -39,27 +65,26 @@ async function getOrCreateCopyrightNotice(workspaceFolder: vscode.Uri): Promise<
  * Proprietary and confidential.
  */
 `;
-        await vscode.workspace.fs.writeFile(copyrightFile, Buffer.from(notice, 'utf8'));
+        await vscode.workspace.fs.writeFile(copyrightUri, Buffer.from(notice, 'utf8'));
         return notice;
     }
 }
 
 export function activate(context: vscode.ExtensionContext) {
     let disposable = vscode.commands.registerCommand('extension.createClassFiles', async () => {
-        // Ensure a workspace is open.
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        if (!workspaceFolders || workspaceFolders.length === 0) {
-            vscode.window.showErrorMessage('No workspace folder open.');
+        // Select the base folder.
+        const baseFolder = await selectBaseFolder();
+        if (!baseFolder) {
             return;
         }
-        const workspaceFolder = workspaceFolders[0].uri;
-        const wsPath = workspaceFolder.fsPath;
+        const wsPath = baseFolder.fsPath;
 
-        // Get or create the COPYRIGHT.txt notice.
+        // Retrieve or create the COPYRIGHT.txt notice.
         let copyrightNotice: string;
         try {
-            copyrightNotice = await getOrCreateCopyrightNotice(workspaceFolder);
-        } catch (error) {
+            copyrightNotice = await getOrCreateCopyrightNotice(baseFolder);
+        } catch (error: any) {
+            vscode.window.showErrorMessage(error.message);
             return;
         }
 
@@ -76,56 +101,69 @@ export function activate(context: vscode.ExtensionContext) {
         const nsInput = await vscode.window.showInputBox({
             prompt: 'Enter namespace (e.g. nebula::math) or leave empty'
         });
-
-        // Process namespace input into nested namespace blocks.
         let openNamespaces = '';
         let closeNamespaces = '';
         if (nsInput && nsInput.trim().length > 0) {
-            const nsParts = nsInput.split('::').map(part => part.trim()).filter(part => part.length > 0);
+            const nsParts = nsInput.split('::').map(s => s.trim()).filter(s => s.length > 0);
             if (nsParts.length > 0) {
                 openNamespaces = nsParts.map(ns => `namespace ${ns} {`).join('\n');
                 closeNamespaces = nsParts.map(() => '}').join('\n');
             }
         }
 
-        // Ask how to place the generated files.
+        // Ask whether to place the files in the same folder or in separate folders.
         const placementOption = await vscode.window.showQuickPick(
-            ["Place files in the same folder", "Place header and source in separate folders"],
-            { placeHolder: "Choose file placement" }
+            ['Same Folder', 'Separate Folders'],
+            { placeHolder: 'Choose file placement' }
         );
         if (!placementOption) {
             return;
         }
 
-        if (placementOption === "Place header and source in separate folders") {
-            // Prompt for header and source subfolders separately.
+        if (placementOption === 'Separate Folders') {
+            // Prompt for header subfolder (e.g. "include/math").
             const headerFolderInput = await vscode.window.showInputBox({
-                prompt: 'Enter header subfolder (relative to workspace, default: include)',
+                prompt: 'Enter header subfolder (relative to base, e.g. include/math)',
                 value: 'include'
             });
+            if (!headerFolderInput) {
+                return;
+            }
+            const headerSubfolder = headerFolderInput.trim();
+
+            // Auto-suggest source subfolder by replacing "include" with "src" if applicable.
+            let defaultSourceSubfolder = headerSubfolder.replace(/^include[\/\\]?/, 'src/');
+            if (defaultSourceSubfolder === headerSubfolder) {
+                defaultSourceSubfolder = 'src';
+            }
             const sourceFolderInput = await vscode.window.showInputBox({
-                prompt: 'Enter source subfolder (relative to workspace, default: src)',
-                value: 'src'
+                prompt: 'Enter source subfolder (relative to base, e.g. src/math)',
+                value: defaultSourceSubfolder
             });
-            const headerFolder = headerFolderInput ? headerFolderInput.trim() : 'include';
-            const sourceFolder = sourceFolderInput ? sourceFolderInput.trim() : 'src';
+            if (!sourceFolderInput) {
+                return;
+            }
+            const sourceSubfolder = sourceFolderInput.trim();
 
             // Compute absolute paths.
-            const headerFolderPath = path.join(wsPath, headerFolder);
-            const sourceFolderPath = path.join(wsPath, sourceFolder);
+            const headerFolderPath = path.join(wsPath, headerSubfolder);
+            const sourceFolderPath = path.join(wsPath, sourceSubfolder);
 
-            // Compute relative path from source folder to header folder for the include directive.
-            let relativeHeaderPath = path.relative(sourceFolderPath, headerFolderPath);
-            // Normalize to forward slashes.
-            relativeHeaderPath = relativeHeaderPath.split(path.sep).join('/');
-            const includeDirective = relativeHeaderPath ? `#include "${relativeHeaderPath}/${className}.hpp"` : `#include "${className}.hpp"`;
+            // For the include directive in the .cpp, simplify by removing "include" prefix.
+            let directiveFolder = headerSubfolder;
+            if (/^include[\/\\]/.test(headerSubfolder)) {
+                directiveFolder = headerSubfolder.replace(/^include[\/\\]/, '');
+            }
+            const includeDirective = directiveFolder
+                ? `#include "${directiveFolder}/${className}.hpp"`
+                : `#include "${className}.hpp"`;
 
-            // Create header file content (.hpp) using #pragma once.
-            let headerContent = `${copyrightNotice}\n`;
+            // Generate header content (.hpp): Copyright notice first, then #pragma once, then (optional) namespaces and class.
+            let headerContent = `${copyrightNotice}\n\n`;
+            headerContent += "#pragma once\n\n";
             if (openNamespaces) {
                 headerContent += `${openNamespaces}\n\n`;
             }
-            headerContent += "#pragma once\n\n";
             headerContent += `class ${className} {\n`;
             headerContent += `public:\n    ${className}();\n    ~${className}();\n\n`;
             headerContent += `private:\n    // Members...\n};\n\n`;
@@ -133,8 +171,8 @@ export function activate(context: vscode.ExtensionContext) {
                 headerContent += `${closeNamespaces}\n`;
             }
 
-            // Create source file content (.cpp) with namespace blocks wrapping the definitions.
-            let sourceContent = `${copyrightNotice}\n`;
+            // Generate source content (.cpp) with simplified include directive.
+            let sourceContent = `${copyrightNotice}\n\n`;
             sourceContent += `${includeDirective}\n\n`;
             if (openNamespaces) {
                 sourceContent += `${openNamespaces}\n\n`;
@@ -145,39 +183,44 @@ export function activate(context: vscode.ExtensionContext) {
                 sourceContent += `${closeNamespaces}\n`;
             }
 
-            // Define URIs for header and source files.
-            const headerUri = vscode.Uri.joinPath(workspaceFolder, headerFolder, `${className}.hpp`);
-            const sourceUri = vscode.Uri.joinPath(workspaceFolder, sourceFolder, `${className}.cpp`);
+            // Define file URIs.
+            const headerUri = vscode.Uri.joinPath(
+                baseFolder,
+                ...headerSubfolder.split('/'),
+                `${className}.hpp`
+            );
+            const sourceUri = vscode.Uri.joinPath(
+                baseFolder,
+                ...sourceSubfolder.split('/'),
+                `${className}.cpp`
+            );
 
             try {
                 await vscode.workspace.fs.writeFile(headerUri, Buffer.from(headerContent, 'utf8'));
                 await vscode.workspace.fs.writeFile(sourceUri, Buffer.from(sourceContent, 'utf8'));
-                vscode.window.showInformationMessage(`Created ${className}.hpp in "${headerFolder}" and ${className}.cpp in "${sourceFolder}"`);
-            } catch (error) {
+                vscode.window.showInformationMessage(
+                    `Created ${className}.hpp in "${headerSubfolder}" and ${className}.cpp in "${sourceSubfolder}"`
+                );
+            } catch (error: any) {
                 vscode.window.showErrorMessage('Error creating files: ' + error);
             }
         } else {
-            // "Place files in the same folder" option.
-            // Prompt for folder (optional; default is workspace root).
+            // Same folder option.
             const folderInput = await vscode.window.showInputBox({
-                prompt: 'Enter folder to place both files (relative to workspace, leave empty for workspace root)',
+                prompt: 'Enter folder (relative to base) to place both files (leave empty for base folder)',
                 value: ''
             });
-            const targetFolder = folderInput ? folderInput.trim() : '';
-            // Compute absolute target path.
-            const targetFolderUri = targetFolder
-                ? vscode.Uri.joinPath(workspaceFolder, targetFolder)
-                : workspaceFolder;
-
-            // In single-folder mode, the source file will include the header with a simple include.
+            const targetSubfolder = folderInput ? folderInput.trim() : '';
+            const targetUri = targetSubfolder
+                ? vscode.Uri.joinPath(baseFolder, ...targetSubfolder.split('/'))
+                : baseFolder;
             const includeDirective = `#include "${className}.hpp"`;
 
-            // Create header file content (.hpp) using #pragma once.
-            let headerContent = `${copyrightNotice}\n`;
+            let headerContent = `${copyrightNotice}\n\n`;
+            headerContent += "#pragma once\n\n";
             if (openNamespaces) {
                 headerContent += `${openNamespaces}\n\n`;
             }
-            headerContent += "#pragma once\n\n";
             headerContent += `class ${className} {\n`;
             headerContent += `public:\n    ${className}();\n    ~${className}();\n\n`;
             headerContent += `private:\n    // Members...\n};\n\n`;
@@ -185,8 +228,7 @@ export function activate(context: vscode.ExtensionContext) {
                 headerContent += `${closeNamespaces}\n`;
             }
 
-            // Create source file content (.cpp).
-            let sourceContent = `${copyrightNotice}\n`;
+            let sourceContent = `${copyrightNotice}\n\n`;
             sourceContent += `${includeDirective}\n\n`;
             if (openNamespaces) {
                 sourceContent += `${openNamespaces}\n\n`;
@@ -197,15 +239,16 @@ export function activate(context: vscode.ExtensionContext) {
                 sourceContent += `${closeNamespaces}\n`;
             }
 
-            // Define URIs for header and source files.
-            const headerUri = vscode.Uri.joinPath(targetFolderUri, `${className}.hpp`);
-            const sourceUri = vscode.Uri.joinPath(targetFolderUri, `${className}.cpp`);
+            const headerUri = vscode.Uri.joinPath(targetUri, `${className}.hpp`);
+            const sourceUri = vscode.Uri.joinPath(targetUri, `${className}.cpp`);
 
             try {
                 await vscode.workspace.fs.writeFile(headerUri, Buffer.from(headerContent, 'utf8'));
                 await vscode.workspace.fs.writeFile(sourceUri, Buffer.from(sourceContent, 'utf8'));
-                vscode.window.showInformationMessage(`Created ${className}.hpp and ${className}.cpp in "${targetFolder || 'workspace root'}"`);
-            } catch (error) {
+                vscode.window.showInformationMessage(
+                    `Created ${className}.hpp and ${className}.cpp in "${targetSubfolder || 'base folder'}"`
+                );
+            } catch (error: any) {
                 vscode.window.showErrorMessage('Error creating files: ' + error);
             }
         }
